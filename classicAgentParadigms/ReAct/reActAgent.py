@@ -1,8 +1,10 @@
-from toolExecutor import ToolExecutor
-from helloAgentsLLM import HelloAgentsLLM
 import re
+
 from dotenv import load_dotenv
-from search import search
+
+from classicAgentParadigms.ReAct.helloAgentsLLM import HelloAgentsLLM
+from classicAgentParadigms.ReAct.search import search
+from classicAgentParadigms.ReAct.toolExecutor import ToolExecutor
 
 # ReAct 提示词模板
 REACT_PROMPT_TEMPLATE = """

@@ -1,6 +1,7 @@
-from toolExecutor import ToolExecutor
-from search import search
 from dotenv import load_dotenv
+
+from classicAgentParadigms.ReAct.search import search
+from classicAgentParadigms.ReAct.toolExecutor import ToolExecutor
 
 # --- 工具初始化与使用示例 ---
 if __name__ == '__main__':
