@@ -232,3 +232,474 @@ classDiagram
 - `PerceptualMemory`
   - 处理 text/image/audio，多模态编码后写 SQLite + 分模态 Qdrant
   - 检索以同模态向量检索为主，关键词为回退
+
+---
+
+## 7) 数据结构流转（用户输入 -> 内存/数据库）
+
+## 7.1 通用流转（所有类型都会经过）
+
+1. 用户通过工具调用（示例）：
+
+```json
+{
+  "action": "add",
+  "content": "用户偏好使用Python进行数据分析",
+  "memory_type": "semantic",
+  "importance": 0.8
+}
+```
+
+2. `MemoryTool` 注入运行态元数据（代码里固定会补）：
+
+```json
+{
+  "session_id": "session_20260329_101530",
+  "timestamp": "2026-03-29T10:15:30.123456"
+}
+```
+
+3. `MemoryManager` 统一构造 `MemoryItem`：
+
+```python
+MemoryItem(
+  id="9de9e1d9-6b7c-4be8-8f78-3d5a9e15b3e1",
+  content="用户偏好使用Python进行数据分析",
+  memory_type="semantic",
+  user_id="user123",
+  timestamp=datetime(...),
+  importance=0.8,
+  metadata={"session_id": "...", "timestamp": "..."}
+)
+```
+
+---
+
+## 7.2 WorkingMemory（仅内存，不落库）
+
+- 用户输入示例：
+
+```json
+{
+  "action": "add",
+  "content": "这轮对话重点是优化检索速度",
+  "memory_type": "working",
+  "importance": 0.7
+}
+```
+
+- 写入后的内存结构：
+  - `self.memories.append(memory_item)`
+  - `self.memory_heap.push((-priority, timestamp, memory_item))`
+  - `self.current_tokens += len(content.split())`
+
+- 示例（简化）：
+
+```python
+self.memories[-1] = MemoryItem(
+  id="a111...",
+  memory_type="working",
+  content="这轮对话重点是优化检索速度",
+  importance=0.7,
+  metadata={"session_id": "...", "timestamp": "..."}
+)
+
+self.memory_heap[0] = (-0.68, datetime(...), <MemoryItem a111...>)
+```
+
+---
+
+## 7.3 EpisodicMemory（内存缓存 + SQLite权威 + Qdrant索引）
+
+- 用户输入示例：
+
+```json
+{
+  "action": "add",
+  "content": "用户询问如何部署服务，助手给出Docker步骤",
+  "memory_type": "episodic",
+  "importance": 0.85
+}
+```
+
+- 内存结构变化：
+  - 生成 `Episode(...)`
+  - `self.episodes.append(episode)`
+  - `self.sessions[session_id].append(episode_id)`
+
+- `Episode` 结构（代码字段）：
+
+```python
+Episode(
+  episode_id="b222...",
+  user_id="user123",
+  session_id="session_20260329_101530",
+  timestamp=datetime(...),
+  content="用户询问如何部署服务，助手给出Docker步骤",
+  context={},
+  outcome=None,
+  importance=0.85
+)
+```
+
+- SQLite `memories` 表写入（`memory_type='episodic'`）：
+  - 列：`id, user_id, content, memory_type, timestamp, importance, properties`
+  - `properties` 示例：
+
+```json
+{
+  "session_id": "session_20260329_101530",
+  "context": {},
+  "outcome": null,
+  "participants": [],
+  "tags": []
+}
+```
+
+- Qdrant payload 示例（向量索引）：
+
+```json
+{
+  "memory_id": "b222...",
+  "user_id": "user123",
+  "memory_type": "episodic",
+  "importance": 0.85,
+  "session_id": "session_20260329_101530",
+  "content": "用户询问如何部署服务，助手给出Docker步骤",
+  "timestamp": 1760000000,
+  "added_at": 1760000000
+}
+```
+
+---
+
+## 7.4 SemanticMemory（内存缓存 + Qdrant + Neo4j）
+
+- 用户输入示例：
+
+```json
+{
+  "action": "add",
+  "content": "张三在OpenAI做多模态模型研究",
+  "memory_type": "semantic",
+  "importance": 0.9
+}
+```
+
+- 内存结构变化：
+  - `self.semantic_memories.append(memory_item)`
+  - `self.memory_embeddings[memory_id] = embedding(np.ndarray)`
+  - `self.entities[entity_id] = Entity(...)`
+  - `self.relations.append(Relation(...))`
+  - `memory_item.metadata["entities"/"relations"]` 被补充
+
+- Qdrant payload 示例：
+
+```json
+{
+  "memory_id": "c333...",
+  "user_id": "user123",
+  "content": "张三在OpenAI做多模态模型研究",
+  "memory_type": "semantic",
+  "importance": 0.9,
+  "entities": ["entity_xxx", "entity_yyy"],
+  "entity_count": 2,
+  "relation_count": 1,
+  "timestamp": 1760000000,
+  "added_at": 1760000000
+}
+```
+
+- Neo4j 存储结构（代码实际）：
+  - 实体节点：`(:Entity {id, name, type, ...})`
+  - 关系：`(:Entity)-[:CO_OCCURS {memory_id, user_id, importance, evidence, ...}]->(:Entity)`
+  - `memory_id`/`user_id`/`importance` 存在于节点属性和关系属性中，用于回溯来源记忆
+
+---
+
+## 7.5 PerceptualMemory（内存缓存 + SQLite权威 + Qdrant分模态）
+
+- 用户输入示例（图片）：
+
+```json
+{
+  "action": "add",
+  "content": "这是一张系统架构图",
+  "memory_type": "perceptual",
+  "importance": 0.75,
+  "file_path": "/data/arch.png",
+  "modality": "image"
+}
+```
+
+- `MemoryTool` 额外注入：
+
+```json
+{
+  "modality": "image",
+  "raw_data": "/data/arch.png",
+  "session_id": "session_20260329_101530",
+  "timestamp": "2026-03-29T10:15:30.123456"
+}
+```
+
+- 内存结构变化：
+  - 生成 `Perception(perception_id, data, modality, encoding, data_hash)`
+  - `self.perceptions[perception_id] = Perception(...)`
+  - `self.modality_index["image"].append(perception_id)`
+  - `memory_item.metadata` 补充 `perception_id/modality`
+  - `self.perceptual_memories.append(memory_item)`
+
+- `Perception` 示例（简化）：
+
+```python
+Perception(
+  perception_id="perception_d444...",
+  data="/data/arch.png",
+  modality="image",
+  encoding=[0.12, 0.87, ...],
+  metadata={"source": "memory_system"}
+)
+```
+
+- SQLite `properties` 示例（`memory_type='perceptual'`）：
+
+```json
+{
+  "perception_id": "perception_d444...",
+  "modality": "image",
+  "context": {},
+  "tags": []
+}
+```
+
+- Qdrant 写入目标集合与 payload：
+  - 集合：`hello_agents_vectors_perceptual_image`（按模态拆分）
+  - payload：
+
+```json
+{
+  "memory_id": "d444...",
+  "user_id": "user123",
+  "memory_type": "perceptual",
+  "modality": "image",
+  "importance": 0.75,
+  "content": "这是一张系统架构图",
+  "timestamp": 1760000000,
+  "added_at": 1760000000
+}
+```
+
+---
+
+## 8) 生命周期补充：update / remove / retrieve
+
+## 8.1 update：数据结构变化示例
+
+- 用户输入示例：
+
+```json
+{
+  "action": "update",
+  "memory_id": "b222...",
+  "content": "用户询问如何部署服务，助手给出Docker与K8s步骤",
+  "importance": 0.92
+}
+```
+
+- `MemoryManager.update_memory()` 路径：
+  - 顺序遍历各记忆类型，先 `has_memory(memory_id)`，命中后调用该类型 `update(...)`
+
+- 各类型更新后的结构变化（示例）：
+  - `WorkingMemory`
+    - `self.memories[i].content/importance/metadata` 更新
+    - `self.current_tokens` 按旧新文本长度差值修正
+    - `self.memory_heap` 重建（优先级重新计算）
+  - `EpisodicMemory`
+    - `self.episodes[i].content/importance/context/outcome` 更新
+    - SQLite `memories` 行更新（`content/importance/properties`）
+    - 若内容变化：重新 embedding，Qdrant 同 `memory_id` upsert 新向量/payload
+  - `SemanticMemory`
+    - `self.memory_embeddings[memory_id]` 更新为新 embedding
+    - `self.semantic_memories` 中对应 `MemoryItem.content/importance/metadata` 更新
+    - 重新抽取实体关系并更新本地 `entities/relations` 缓存
+  - `PerceptualMemory`
+    - `self.perceptual_memories` 中对应项更新
+    - SQLite `memories` 行更新
+    - 若 `content/raw_data` 变化：重编码并尝试向量 upsert
+
+### update 时序图
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant T as MemoryTool
+    participant M as MemoryManager
+    participant X as 命中的MemoryType
+    participant S as SQLite
+    participant Q as Qdrant
+    participant G as Neo4j
+
+    A->>T: run({action:update, memory_id, content?, importance?})
+    T->>M: update_memory(memory_id, content, importance, metadata)
+    M->>M: 遍历memory_types并has_memory(memory_id)
+    M->>X: X.update(...)
+
+    alt WorkingMemory
+        X->>X: 更新memories + token计数 + 重建heap
+    else EpisodicMemory
+        X->>X: 更新episodes缓存
+        X->>S: update_memory(...)
+        X->>Q: 内容变更时upsert向量
+    else SemanticMemory
+        X->>X: 更新embedding/实体/关系缓存
+        X->>G: 实体关系主要在add路径写入
+        X->>Q: 更新路径以本地结构更新为主
+    else PerceptualMemory
+        X->>X: 更新perceptual_memories/perceptions
+        X->>S: update_memory(...)
+        X->>Q: 内容或raw_data变化时尝试upsert
+    end
+
+    X-->>M: bool
+    M-->>T: bool
+    T-->>A: ✅/⚠️ 更新结果
+```
+
+---
+
+## 8.2 remove：数据结构变化示例
+
+- 用户输入示例：
+
+```json
+{
+  "action": "remove",
+  "memory_id": "c333..."
+}
+```
+
+- `MemoryManager.remove_memory()` 路径：
+  - 顺序遍历 `memory_types`，命中后执行该类型 `remove(memory_id)`
+
+- 各类型删除后的结构变化（示例）：
+  - `WorkingMemory`
+    - 从 `self.memories` 删除项
+    - `current_tokens` 扣减
+    - 堆删除采用标记/后续重建策略
+  - `EpisodicMemory`
+    - 从 `self.episodes` 删除
+    - 从 `self.sessions[session_id]` 删除对应 `episode_id`，空会话键清理
+    - SQLite 删除 `memories.id=memory_id`
+    - Qdrant 按 payload `memory_id` 删除向量
+  - `SemanticMemory`
+    - Qdrant 删除该 `memory_id` 向量
+    - 从 `self.semantic_memories` 删除
+    - 从 `self.memory_embeddings` 删除
+  - `PerceptualMemory`
+    - 从 `self.perceptual_memories` 删除
+    - 从 `self.perceptions` 与 `self.modality_index` 删除 `perception_id`
+    - SQLite 删除 `memories.id=memory_id`
+    - 所有感知模态集合尝试删除该 `memory_id` 向量
+
+### remove 时序图
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant T as MemoryTool
+    participant M as MemoryManager
+    participant X as 命中的MemoryType
+    participant DB as SQLite/Qdrant/Neo4j
+
+    A->>T: run({action:remove, memory_id})
+    T->>M: remove_memory(memory_id)
+    M->>M: 遍历memory_types并has_memory(memory_id)
+    M->>X: X.remove(memory_id)
+
+    alt WorkingMemory
+        X->>X: 删除内存项并修正token
+    else EpisodicMemory
+        X->>X: 删除episodes/sessions缓存
+        X->>DB: 删SQLite + 删Qdrant
+    else SemanticMemory
+        X->>X: 删除semantic_memories/memory_embeddings
+        X->>DB: 删Qdrant(知识图缓存同步清理)
+    else PerceptualMemory
+        X->>X: 删除perceptions/modality_index缓存
+        X->>DB: 删SQLite + 删各模态Qdrant
+    end
+
+    X-->>M: bool
+    M-->>T: bool
+    T-->>A: ✅/⚠️ 删除结果
+```
+
+---
+
+## 8.3 retrieve：数据结构变化示例
+
+- 用户输入示例：
+
+```json
+{
+  "action": "search",
+  "query": "部署服务",
+  "limit": 6,
+  "memory_type": null
+}
+```
+
+- `MemoryManager.retrieve_memories()` 关键步骤（示例）：
+  - `memory_types=None` 时检索所有启用类型
+  - `per_type_limit = max(1, limit // len(memory_types))`
+  - 分类型调用 `retrieve(...)` 得到 `List[MemoryItem]`
+  - 聚合后按 `importance` 排序再截断为 `limit`
+
+- 返回结果中的 `MemoryItem.metadata` 会因类型扩展：
+  - `WorkingMemory`：基本沿用原 metadata（会话字段等）
+  - `EpisodicMemory`：追加 `relevance_score/vector_score/recency_score`，并带 `session_id/context/outcome`
+  - `SemanticMemory`：追加 `combined_score/vector_score/graph_score/probability`
+  - `PerceptualMemory`：追加 `relevance_score/vector_score/recency_score`，并带 `modality/perception_id`
+
+### retrieve 时序图（细化版）
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant T as MemoryTool
+    participant M as MemoryManager
+    participant W as Working
+    participant E as Episodic
+    participant S as Semantic
+    participant P as Perceptual
+    participant SQL as SQLite
+    participant Q as Qdrant
+    participant N as Neo4j
+
+    A->>T: run({action:search, query, limit, memory_type?})
+    T->>M: retrieve_memories(...)
+    M->>M: 计算per_type_limit
+
+    par Working
+        M->>W: retrieve(query,...)
+        W->>W: 内存匹配(TF-IDF/关键词)+时间衰减
+    and Episodic
+        M->>E: retrieve(query,...)
+        E->>Q: 向量召回
+        E->>SQL: 按memory_id回表取完整记录
+    and Semantic
+        M->>S: retrieve(query,...)
+        S->>Q: 向量召回
+        S->>N: 图搜索与实体扩展
+        S->>S: 融合打分并写入metadata
+    and Perceptual
+        M->>P: retrieve(query,...)
+        P->>Q: 按模态集合向量召回
+        P->>SQL: 回表取完整记录
+    end
+
+    M->>M: 聚合并按importance排序后截断
+    M-->>T: List[MemoryItem]
+    T-->>A: 格式化检索结果
+```
